@@ -1,64 +1,64 @@
-from fastapi import FastAPI, WebSocket
+import os
 import json
-import uuid
+from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
+# ================= APP =================
 app = FastAPI()
-clients = {}  # id -> websocket
-nicks = {}    # id -> nick
 
+# Разрешаем все CORS (для теста)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# ================= STATE =================
+connected = {}          # client_id -> WebSocket
+offline_messages = {}   # client_id -> [messages]
+
+# ================= WEBSOCKET =================
 @app.websocket("/ws")
-async def ws(ws: WebSocket):
+async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-
-    client_id = str(uuid.uuid4())[:8]
-    clients[client_id] = ws
-    nick = await ws.receive_text()
-    nicks[client_id] = nick
-
-    # отправляем клиенту его ID
-    await ws.send_text(json.dumps({"type": "id", "id": client_id}))
-
-    async def broadcast_list():
-        data = json.dumps({"type": "list", "users": nicks})
-        for c in clients.values():
-            await c.send_text(data)
-
-    await broadcast_list()
-
+    client_id = None
     try:
         while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            msg_type = msg.get("type")
+            data = await ws.receive_text()
+            msg = json.loads(data)
 
-            # передача сообщений выбранным пользователям
-            if msg_type == "msg":
-                targets = msg.get("to", [])
-                data = msg.get("data")
-                for t in targets:
-                    if t in clients:
-                        await clients[t].send_text(json.dumps({
-                            "from": client_id,
-                            "type": "msg",
-                            "data": data
-                        }))
+            # ---------- регистрация ----------
+            if msg["type"] == "register":
+                client_id = msg["id"]
+                connected[client_id] = ws
+                print(f"[+] {client_id} connected")
 
-            # передача публичного ключа для E2EE
-            elif msg_type == "key":
-                to = msg.get("to")
-                if to in clients:
-                    await clients[to].send_text(json.dumps({
-                        "from": client_id,
-                        "type": "key",
-                        "key": msg["key"]
-                    }))
+                # Отправляем оффлайн-сообщения
+                for m in offline_messages.get(client_id, []):
+                    await ws.send_text(json.dumps(m))
+                offline_messages[client_id] = []
 
-            # обновляем список пользователей
-            await broadcast_list()
+            # ---------- сообщение ----------
+            elif msg["type"] == "message":
+                to_id = msg["to"]
+                payload = {"type":"message", "from":msg["from"], "text":msg["text"]}
+
+                if to_id in connected:
+                    await connected[to_id].send_text(json.dumps(payload))
+                else:
+                    offline_messages.setdefault(to_id, []).append(payload)
 
     except:
         pass
     finally:
-        clients.pop(client_id, None)
-        nicks.pop(client_id, None)
-        await broadcast_list()
+        if client_id and client_id in connected:
+            connected.pop(client_id)
+            print(f"[-] {client_id} disconnected")
+
+# ================= RUN =================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Server starting on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
